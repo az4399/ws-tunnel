@@ -7,3 +7,4 @@ local_addr = "127.0.0.1:22"
 worker_pool_size = 8
 reconnect_delay_secs = 3
 connect_timeout_secs = 10
+heartbeat_interval_secs = 20

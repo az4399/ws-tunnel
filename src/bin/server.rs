@@ -61,6 +61,7 @@ async fn run_ws_listener(
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        stream.set_nodelay(true)?;
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_worker(stream, state).await {
@@ -122,10 +123,11 @@ async fn handle_worker(
     }
 
     let mapping = ensure_mapping(state.clone(), remote_port).await?;
+    eprintln!("worker authenticated and waiting for remote port {remote_port}");
     let (assign, assigned_tcp) = oneshot::channel();
     mapping.idle_tx.send(WorkerHandle { assign }).await?;
 
-    let tcp_stream = assigned_tcp.await?;
+    let tcp_stream = wait_for_assignment(&mut ws, assigned_tcp).await?;
     ws.send(protocol::start()).await?;
 
     let ready = timeout(
@@ -147,7 +149,7 @@ async fn handle_worker(
         None => return Err("worker closed before START confirmation".into()),
     }
 
-    bridge_ws_and_tcp(ws, tcp_stream).await
+    bridge_ws_and_tcp(ws, tcp_stream, None).await
 }
 
 async fn ensure_mapping(state: Arc<ServerState>, remote_port: u16) -> Result<Arc<MappingState>, DynError> {
@@ -199,8 +201,39 @@ async fn run_dynamic_tcp_listener(
 ) -> Result<(), DynError> {
     loop {
         let (stream, addr) = listener.accept().await?;
+        stream.set_nodelay(true)?;
         if tcp_tx.send(stream).await.is_err() {
             eprintln!("dispatcher closed for port {remote_port}, dropping connection from {addr}");
+        }
+    }
+}
+
+async fn wait_for_assignment(
+    ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    assigned_tcp: oneshot::Receiver<TcpStream>,
+) -> Result<TcpStream, DynError> {
+    tokio::pin!(assigned_tcp);
+
+    loop {
+        tokio::select! {
+            tcp = &mut assigned_tcp => return Ok(tcp?),
+            incoming = ws.next() => {
+                match incoming {
+                    Some(Ok(Message::Ping(data))) => {
+                        ws.send(Message::Pong(data)).await?;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) => return Err("worker closed before assignment".into()),
+                    Some(Ok(Message::Text(text))) => {
+                        return Err(format!("unexpected text command before assignment: {text}").into());
+                    }
+                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {
+                        return Err("unexpected binary frame before assignment".into());
+                    }
+                    Some(Err(err)) => return Err(err.into()),
+                    None => return Err("worker disconnected before assignment".into()),
+                }
+            }
         }
     }
 }
@@ -213,6 +246,12 @@ fn validate_path(
     if request.uri().path() == expected_path {
         return Ok(response);
     }
+
+    eprintln!(
+        "rejected websocket request path {:?}, expected {:?}",
+        request.uri().path(),
+        expected_path
+    );
 
     let response = Response::builder()
         .status(StatusCode::NOT_FOUND)

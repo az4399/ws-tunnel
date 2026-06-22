@@ -31,6 +31,8 @@ pub struct ClientConfig {
     pub reconnect_delay_secs: u64,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
 }
 
 fn default_backlog() -> usize {
@@ -47,6 +49,10 @@ fn default_reconnect_delay() -> u64 {
 
 fn default_connect_timeout() -> u64 {
     10
+}
+
+fn default_heartbeat_interval() -> u64 {
+    20
 }
 
 fn default_handshake_timeout() -> u64 {

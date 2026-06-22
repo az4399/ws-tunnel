@@ -49,34 +49,29 @@ async fn main() -> Result<(), DynError> {
 async fn run_worker_loop(worker_id: usize, cfg: Arc<ClientConfig>) {
     loop {
         if let Err(err) = run_worker_once(worker_id, cfg.clone()).await {
-            eprintln!("worker {worker_id} reconnecting after error: {err}");
+            eprintln!(
+                "worker {worker_id} reconnecting after error: {err}; retrying in {}s",
+                cfg.reconnect_delay_secs
+            );
         }
-        sleep(Duration::from_secs(cfg.reconnect_delay_secs)).await;
+        sleep(reconnect_delay(worker_id, cfg.reconnect_delay_secs)).await;
     }
 }
 
 async fn run_worker_once(worker_id: usize, cfg: Arc<ClientConfig>) -> Result<(), DynError> {
     let (mut ws, _) = connect_websocket(&cfg).await?;
+    let dial_target = cfg.connect_host.as_deref().unwrap_or("server_url host");
+    eprintln!(
+        "worker {worker_id} connected to {} using {} for remote port {}",
+        cfg.server_url, dial_target, cfg.remote_port
+    );
     ws.send(protocol::hello(&cfg.token, cfg.remote_port)).await?;
 
+    let heartbeat_interval = heartbeat_duration(cfg.heartbeat_interval_secs);
     loop {
-        match ws.next().await {
-            Some(Ok(Message::Text(text))) if text == protocol::CMD_START => break,
-            Some(Ok(Message::Text(text))) => {
-                if let Some(err_text) = protocol::parse_err(&text) {
-                    return Err(format!("server rejected worker {worker_id}: {err_text}").into());
-                }
-                return Err(format!("unexpected text command for worker {worker_id}: {text}").into());
-            }
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
-            Some(Ok(Message::Close(_))) => {
-                return Err(format!("server closed worker {worker_id} before START").into());
-            }
-            Some(Ok(_)) => {
-                return Err(format!("unexpected non-text command for worker {worker_id}").into());
-            }
-            Some(Err(err)) => return Err(err.into()),
-            None => return Err(format!("server closed worker {worker_id}").into()),
+        match wait_for_start(&mut ws, heartbeat_interval).await? {
+            WorkerCommand::Start => break,
+            WorkerCommand::Ignore => continue,
         }
     }
 
@@ -96,9 +91,56 @@ async fn run_worker_once(worker_id: usize, cfg: Arc<ClientConfig>) -> Result<(),
             return Err("local connect timeout".into());
         }
     };
+    tcp.set_nodelay(true)?;
+    eprintln!(
+        "worker {worker_id} bound remote port {} to local {}",
+        cfg.remote_port, cfg.local_addr
+    );
 
     ws.send(protocol::ok()).await?;
-    bridge_ws_and_tcp(ws, tcp).await
+    bridge_ws_and_tcp(ws, tcp, heartbeat_interval).await
+}
+
+enum WorkerCommand {
+    Start,
+    Ignore,
+}
+
+async fn wait_for_start(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    heartbeat_interval: Option<Duration>,
+) -> Result<WorkerCommand, DynError> {
+    if let Some(heartbeat_interval) = heartbeat_interval {
+        tokio::select! {
+            incoming = ws.next() => handle_worker_message(incoming),
+            _ = sleep(heartbeat_interval) => {
+                ws.send(Message::Ping(Vec::new().into())).await?;
+                Ok(WorkerCommand::Ignore)
+            }
+        }
+    } else {
+        handle_worker_message(ws.next().await)
+    }
+}
+
+fn handle_worker_message(
+    message: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+) -> Result<WorkerCommand, DynError> {
+    match message {
+        Some(Ok(Message::Text(text))) if text == protocol::CMD_START => Ok(WorkerCommand::Start),
+        Some(Ok(Message::Text(text))) => {
+            if let Some(err_text) = protocol::parse_err(&text) {
+                return Err(format!("server rejected worker: {err_text}").into());
+            }
+            Err(format!("unexpected text command from server: {text}").into())
+        }
+        Some(Ok(Message::Ping(_))) => Ok(WorkerCommand::Ignore),
+        Some(Ok(Message::Pong(_))) => Ok(WorkerCommand::Ignore),
+        Some(Ok(Message::Close(_))) => Err("server closed worker before START".into()),
+        Some(Ok(_)) => Err("unexpected non-text command from server".into()),
+        Some(Err(err)) => Err(err.into()),
+        None => Err("server closed worker".into()),
+    }
 }
 
 async fn connect_websocket(
@@ -142,4 +184,18 @@ async fn connect_websocket(
     .await??;
 
     Ok(connected)
+}
+
+fn heartbeat_duration(secs: u64) -> Option<Duration> {
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
+}
+
+fn reconnect_delay(worker_id: usize, base_secs: u64) -> Duration {
+    let base = Duration::from_secs(base_secs);
+    let jitter_ms = ((worker_id as u64) % 10) * 200;
+    base + Duration::from_millis(jitter_ms)
 }

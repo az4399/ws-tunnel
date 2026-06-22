@@ -47,6 +47,7 @@ local_addr = "127.0.0.1:22"
 worker_pool_size = 8
 reconnect_delay_secs = 3
 connect_timeout_secs = 10
+heartbeat_interval_secs = 20
 ```
 
 4. Connect to the VPS public port:
@@ -75,5 +76,6 @@ cargo run --release --bin client -- examples/client.toml
 - `wss` is expected to be terminated by Cloudflare before reaching the VPS origin.
 - The client decides `remote_port`, and the server opens that TCP listener on demand.
 - You can keep `server_url` as a domain name and set `connect_host` to force the underlying TCP connection to a specific host or IP.
+- `heartbeat_interval_secs` controls WebSocket ping keepalive. Set it to `0` to disable heartbeats.
 - One incoming TCP connection consumes one idle worker WebSocket from the client pool.
 - If all workers are busy, new TCP connections wait in the pending queue.
