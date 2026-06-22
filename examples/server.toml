@@ -1,0 +1,7 @@
+ws_bind = "0.0.0.0:8080"
+tcp_bind_addr = "0.0.0.0"
+path = "/tunnel"
+token = "change-me"
+pending_tcp_backlog = 128
+idle_worker_backlog = 128
+handshake_timeout_secs = 10
