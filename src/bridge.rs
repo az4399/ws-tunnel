@@ -95,7 +95,7 @@ where
     };
 
     drop(outbound_tx);
-    let writer_result = writer.await??;
+    writer.await??;
     result?;
-    writer_result
+    Ok(())
 }
