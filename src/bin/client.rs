@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use http::Uri;
@@ -13,6 +14,12 @@ use ws_tunnel::config::{load_client_config, ClientConfig, DynError};
 use ws_tunnel::protocol;
 use ws_tunnel::tls::ensure_rustls_crypto_provider;
 
+struct WorkerPoolState {
+    next_worker_id: AtomicUsize,
+    total_workers: AtomicUsize,
+    idle_workers: AtomicUsize,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
     ensure_rustls_crypto_provider();
@@ -23,42 +30,67 @@ async fn main() -> Result<(), DynError> {
     };
 
     let cfg = Arc::new(load_client_config(&config_path)?);
-    let mut handles = Vec::with_capacity(cfg.worker_pool_size);
+    let max_total_workers = cfg.max_total_workers.max(1);
+    let idle_target = cfg.worker_pool_size.max(1).min(max_total_workers);
+    if cfg.worker_pool_size.max(1) > max_total_workers {
+        eprintln!(
+            "worker_pool_size {} is higher than max_total_workers {}; idle pool will be capped at {}",
+            cfg.worker_pool_size.max(1),
+            max_total_workers,
+            idle_target
+        );
+    }
+    let pool = Arc::new(WorkerPoolState {
+        next_worker_id: AtomicUsize::new(0),
+        total_workers: AtomicUsize::new(0),
+        idle_workers: AtomicUsize::new(0),
+    });
 
-    for worker_id in 0..cfg.worker_pool_size {
-        let cfg = cfg.clone();
-        handles.push(tokio::spawn(async move {
-            run_worker_loop(worker_id, cfg).await;
-        }));
+    for _ in 0..idle_target {
+        let _ = spawn_worker(cfg.clone(), pool.clone());
     }
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("client received Ctrl+C, shutting down");
-        }
-        _ = async {
-            for handle in handles {
-                let _ = handle.await;
-            }
-        } => {}
-    }
+    tokio::signal::ctrl_c().await?;
+    eprintln!("client received Ctrl+C, shutting down");
 
     Ok(())
 }
 
-async fn run_worker_loop(worker_id: usize, cfg: Arc<ClientConfig>) {
+fn spawn_worker(
+    cfg: Arc<ClientConfig>,
+    pool: Arc<WorkerPoolState>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let worker_id = reserve_worker_slot(&pool, cfg.max_total_workers.max(1))?;
+    Some(tokio::spawn(async move {
+        run_worker_loop(worker_id, cfg, pool.clone()).await;
+        let remaining = pool.total_workers.fetch_sub(1, Ordering::SeqCst) - 1;
+        eprintln!("worker {worker_id} stopped; total workers now {remaining}");
+    }))
+}
+
+async fn run_worker_loop(worker_id: usize, cfg: Arc<ClientConfig>, pool: Arc<WorkerPoolState>) {
     loop {
-        if let Err(err) = run_worker_once(worker_id, cfg.clone()).await {
+        if let Err(err) = run_worker_once(worker_id, cfg.clone(), pool.clone()).await {
             eprintln!(
                 "worker {worker_id} reconnecting after error: {err}; retrying in {}s",
                 cfg.reconnect_delay_secs
             );
         }
+
+        if should_retire_worker(&cfg, &pool) {
+            eprintln!("worker {worker_id} retired because idle capacity is already sufficient");
+            return;
+        }
+
         sleep(reconnect_delay(worker_id, cfg.reconnect_delay_secs)).await;
     }
 }
 
-async fn run_worker_once(worker_id: usize, cfg: Arc<ClientConfig>) -> Result<(), DynError> {
+async fn run_worker_once(
+    worker_id: usize,
+    cfg: Arc<ClientConfig>,
+    pool: Arc<WorkerPoolState>,
+) -> Result<(), DynError> {
     let (mut ws, _) = connect_websocket(&cfg).await?;
     let dial_target = cfg
         .connect_host
@@ -72,10 +104,20 @@ async fn run_worker_once(worker_id: usize, cfg: Arc<ClientConfig>) -> Result<(),
     ws.send(protocol::hello(&cfg.token, cfg.remote_port)).await?;
 
     let heartbeat_interval = heartbeat_duration(cfg.heartbeat_interval_secs);
+    let mut counted_idle = false;
+    mark_idle(&pool, &mut counted_idle, worker_id, cfg.remote_port);
     loop {
-        match wait_for_start(&mut ws, heartbeat_interval).await? {
-            WorkerCommand::Start => break,
-            WorkerCommand::Ignore => continue,
+        match wait_for_start(&mut ws, heartbeat_interval).await {
+            Ok(WorkerCommand::Start) => {
+                unmark_idle(&pool, &mut counted_idle);
+                ensure_idle_capacity(worker_id, cfg.clone(), pool.clone());
+                break;
+            }
+            Ok(WorkerCommand::Ignore) => continue,
+            Err(err) => {
+                unmark_idle(&pool, &mut counted_idle);
+                return Err(err);
+            }
         }
     }
 
@@ -92,7 +134,10 @@ async fn run_worker_once(worker_id: usize, cfg: Arc<ClientConfig>) -> Result<(),
         }
         Err(_) => {
             let _ = ws.send(protocol::err("local connect timeout")).await;
-            return Err("local connect timeout".into());
+            return Err(format!(
+                "timed out opening local target {}; check whether the local service is reachable",
+                cfg.local_addr
+            ).into());
         }
     };
     tcp.set_nodelay(true)?;
@@ -178,14 +223,33 @@ async fn connect_websocket(
         Duration::from_secs(cfg.connect_timeout_secs),
         TcpStream::connect((host, port)),
     )
-    .await??;
+    .await
+    .map_err(|_| {
+        format!(
+            "timed out connecting to websocket endpoint {} via {}:{}; check whether the server, reverse proxy, or firewall is reachable",
+            cfg.server_url, host, port
+        )
+    })?
+    .map_err(|err| {
+        format!(
+            "failed to connect to websocket endpoint {} via {}:{}: {}; check whether the server, reverse proxy, or firewall is reachable",
+            cfg.server_url, host, port, err
+        )
+    })?;
     tcp.set_nodelay(true)?;
 
     let connected = timeout(
         Duration::from_secs(cfg.connect_timeout_secs),
         client_async_tls_with_config(request, tcp, None, None),
     )
-    .await??;
+    .await
+    .map_err(|_| {
+        format!(
+            "timed out completing websocket handshake for {}; check the server path, reverse proxy, and TLS settings",
+            cfg.server_url
+        )
+    })?
+    .map_err(|err| describe_handshake_error(&cfg.server_url, err))?;
 
     Ok(connected)
 }
@@ -204,9 +268,102 @@ fn reconnect_delay(worker_id: usize, base_secs: u64) -> Duration {
     base + Duration::from_millis(jitter_ms)
 }
 
+fn reserve_worker_slot(pool: &WorkerPoolState, max_total_workers: usize) -> Option<usize> {
+    loop {
+        let total = pool.total_workers.load(Ordering::SeqCst);
+        if total >= max_total_workers {
+            return None;
+        }
+
+        if pool
+            .total_workers
+            .compare_exchange(total, total + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Some(pool.next_worker_id.fetch_add(1, Ordering::SeqCst));
+        }
+    }
+}
+
+fn mark_idle(pool: &WorkerPoolState, counted_idle: &mut bool, worker_id: usize, remote_port: u16) {
+    if !*counted_idle {
+        let idle = pool.idle_workers.fetch_add(1, Ordering::SeqCst) + 1;
+        *counted_idle = true;
+        eprintln!(
+            "worker {worker_id} is idle for remote port {remote_port}; idle workers now {idle}"
+        );
+    }
+}
+
+fn unmark_idle(pool: &WorkerPoolState, counted_idle: &mut bool) {
+    if *counted_idle {
+        pool.idle_workers.fetch_sub(1, Ordering::SeqCst);
+        *counted_idle = false;
+    }
+}
+
+fn ensure_idle_capacity(worker_id: usize, cfg: Arc<ClientConfig>, pool: Arc<WorkerPoolState>) {
+    let idle_target = cfg.worker_pool_size.max(1).min(cfg.max_total_workers.max(1));
+    let idle = pool.idle_workers.load(Ordering::SeqCst);
+    let total = pool.total_workers.load(Ordering::SeqCst);
+
+    if idle >= idle_target {
+        return;
+    }
+
+    if let Some(handle) = spawn_worker(cfg.clone(), pool.clone()) {
+        drop(handle);
+        eprintln!(
+            "worker {worker_id} became busy; spawning replacement worker (idle {idle}, total {total})"
+        );
+    } else if total < idle_target {
+        eprintln!(
+            "worker {worker_id} became busy, but worker cap {} prevents keeping {} idle workers ready",
+            cfg.max_total_workers.max(1),
+            idle_target
+        );
+    }
+}
+
+fn should_retire_worker(cfg: &ClientConfig, pool: &WorkerPoolState) -> bool {
+    let idle_target = cfg.worker_pool_size.max(1).min(cfg.max_total_workers.max(1));
+    let idle = pool.idle_workers.load(Ordering::SeqCst);
+    let total = pool.total_workers.load(Ordering::SeqCst);
+    total > idle_target && idle >= idle_target
+}
+
 fn host_from_server_url(server_url: &str) -> Result<String, DynError> {
     let uri: Uri = server_url.parse()?;
     uri.host()
         .map(str::to_string)
         .ok_or_else(|| "server_url is missing a host".into())
+}
+
+fn describe_handshake_error(
+    server_url: &str,
+    err: tokio_tungstenite::tungstenite::Error,
+) -> DynError {
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            let status = response.status();
+            if status == http::StatusCode::NOT_FOUND {
+                format!(
+                    "websocket handshake for {} returned 404 Not Found; check that the server path matches exactly",
+                    server_url
+                )
+                .into()
+            } else {
+                format!(
+                    "websocket handshake for {} failed with HTTP {}; check the reverse proxy, path, and authentication rules",
+                    server_url, status
+                )
+                .into()
+            }
+        }
+        other => format!(
+            "failed to complete websocket handshake for {}: {}; check the server path, reverse proxy, and TLS settings",
+            server_url, other
+        )
+        .into(),
+    }
 }

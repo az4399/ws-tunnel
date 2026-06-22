@@ -27,6 +27,8 @@ pub struct ClientConfig {
     pub local_addr: String,
     #[serde(default = "default_worker_pool")]
     pub worker_pool_size: usize,
+    #[serde(default = "default_max_total_workers")]
+    pub max_total_workers: usize,
     #[serde(default = "default_reconnect_delay")]
     pub reconnect_delay_secs: u64,
     #[serde(default = "default_connect_timeout")]
@@ -49,6 +51,10 @@ fn default_reconnect_delay() -> u64 {
 
 fn default_connect_timeout() -> u64 {
     10
+}
+
+fn default_max_total_workers() -> usize {
+    64
 }
 
 fn default_heartbeat_interval() -> u64 {

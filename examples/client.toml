@@ -5,6 +5,7 @@ token = "change-me"
 remote_port = 7000
 local_addr = "127.0.0.1:22"
 worker_pool_size = 8
+max_total_workers = 64
 reconnect_delay_secs = 3
 connect_timeout_secs = 10
 heartbeat_interval_secs = 20

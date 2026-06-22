@@ -60,12 +60,20 @@ async fn run_ws_listener(
     eprintln!("ws server listening on {}", state.cfg.ws_bind);
 
     loop {
-        let (stream, addr) = listener.accept().await?;
-        stream.set_nodelay(true)?;
+        let (stream, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("temporary accept error on {}: {err}", state.cfg.ws_bind);
+                continue;
+            }
+        };
+        if let Err(err) = stream.set_nodelay(true) {
+            eprintln!("failed to enable TCP_NODELAY for worker session from {addr}: {err}");
+        }
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_worker(stream, state).await {
-                eprintln!("worker session from {addr} ended: {err}");
+                eprintln!("worker session from {addr} ended: {}", describe_worker_error(&err));
             }
         });
     }
@@ -200,8 +208,16 @@ async fn run_dynamic_tcp_listener(
     tcp_tx: mpsc::Sender<TcpStream>,
 ) -> Result<(), DynError> {
     loop {
-        let (stream, addr) = listener.accept().await?;
-        stream.set_nodelay(true)?;
+        let (stream, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("temporary TCP accept error on remote port {remote_port}: {err}");
+                continue;
+            }
+        };
+        if let Err(err) = stream.set_nodelay(true) {
+            eprintln!("failed to enable TCP_NODELAY for remote client {addr} on port {remote_port}: {err}");
+        }
         if tcp_tx.send(stream).await.is_err() {
             eprintln!("dispatcher closed for port {remote_port}, dropping connection from {addr}");
         }
@@ -258,4 +274,21 @@ fn validate_path(
         .body(Some("not found".to_string()))
         .expect("failed to build websocket rejection response");
     Err(response)
+}
+
+fn describe_worker_error(err: &DynError) -> String {
+    let text = err.to_string();
+    if text.contains("Connection reset without closing handshake") {
+        return "websocket peer reset the connection without a closing handshake; this usually means the reverse proxy or network dropped an idle or unstable connection".to_string();
+    }
+    if text.contains("Connection reset by peer") {
+        return "tcp peer reset the connection; this usually means the client, reverse proxy, or network closed the socket abruptly".to_string();
+    }
+    if text.contains("invalid token") || text.contains("token mismatch") {
+        return "worker authentication failed because the provided token did not match the server token".to_string();
+    }
+    if text.contains("worker closed before HELLO") || text.contains("first worker frame must be text HELLO") {
+        return "worker disconnected before sending a valid HELLO authentication frame".to_string();
+    }
+    text
 }
