@@ -22,7 +22,7 @@ async fn main() -> Result<(), DynError> {
         CliAction::ExitAfterHelp => return Ok(()),
     };
 
-    let cfg = Arc::new(load_client_config(&config_path).await?);
+    let cfg = Arc::new(load_client_config(&config_path)?);
     let mut handles = Vec::with_capacity(cfg.worker_pool_size);
 
     for worker_id in 0..cfg.worker_pool_size {
@@ -60,7 +60,11 @@ async fn run_worker_loop(worker_id: usize, cfg: Arc<ClientConfig>) {
 
 async fn run_worker_once(worker_id: usize, cfg: Arc<ClientConfig>) -> Result<(), DynError> {
     let (mut ws, _) = connect_websocket(&cfg).await?;
-    let dial_target = cfg.connect_host.as_deref().unwrap_or("server_url host");
+    let dial_target = cfg
+        .connect_host
+        .clone()
+        .or_else(|| host_from_server_url(&cfg.server_url).ok())
+        .unwrap_or_else(|| "unknown".to_string());
     eprintln!(
         "worker {worker_id} connected to {} using {} for remote port {}",
         cfg.server_url, dial_target, cfg.remote_port
@@ -198,4 +202,11 @@ fn reconnect_delay(worker_id: usize, base_secs: u64) -> Duration {
     let base = Duration::from_secs(base_secs);
     let jitter_ms = ((worker_id as u64) % 10) * 200;
     base + Duration::from_millis(jitter_ms)
+}
+
+fn host_from_server_url(server_url: &str) -> Result<String, DynError> {
+    let uri: Uri = server_url.parse()?;
+    uri.host()
+        .map(str::to_string)
+        .ok_or_else(|| "server_url is missing a host".into())
 }

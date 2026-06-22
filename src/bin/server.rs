@@ -36,7 +36,7 @@ async fn main() -> Result<(), DynError> {
         CliAction::ExitAfterHelp => return Ok(()),
     };
 
-    let cfg = Arc::new(load_server_config(&config_path).await?);
+    let cfg = Arc::new(load_server_config(&config_path)?);
     let state = Arc::new(ServerState {
         cfg,
         mappings: Mutex::new(HashMap::new()),

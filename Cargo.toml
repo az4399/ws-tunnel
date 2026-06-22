@@ -4,16 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [profile.release]
+opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = true
+debug = false
+incremental = false
+strip = "symbols"
 
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.23", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
-toml = "0.8"
+toml = { version = "0.8", default-features = false, features = ["parse"] }

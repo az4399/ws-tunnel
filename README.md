@@ -63,11 +63,46 @@ cargo build --release --bin server
 cargo build --release --bin client
 ```
 
+Release builds are configured for fully static `musl` targets and size-oriented optimization.
+
 ## Run
 
 ```bash
 cargo run --release --bin server -- examples/server.toml
 cargo run --release --bin client -- examples/client.toml
+```
+
+Client container example:
+
+```bash
+docker run --rm \
+  -v /path/to/client.toml:/client.toml:ro \
+  ghcr.io/<owner>/ws-tunnel-client:latest
+```
+
+Docker Compose example:
+
+```yaml
+services:
+  ws-tunnel-client:
+    image: ghcr.io/<owner>/ws-tunnel-client:latest
+    container_name: ws-tunnel-client
+    restart: unless-stopped
+    volumes:
+      - /opt/ws-tunnel/client.toml:/client.toml:ro
+```
+
+If you prefer mounting a whole directory instead of a single file:
+
+```yaml
+services:
+  ws-tunnel-client:
+    image: ghcr.io/<owner>/ws-tunnel-client:latest
+    container_name: ws-tunnel-client
+    restart: unless-stopped
+    volumes:
+      - /opt/ws-tunnel:/config:ro
+    command: ["/config/client.toml"]
 ```
 
 ## Notes
@@ -79,3 +114,11 @@ cargo run --release --bin client -- examples/client.toml
 - `heartbeat_interval_secs` controls WebSocket ping keepalive. Set it to `0` to disable heartbeats.
 - One incoming TCP connection consumes one idle worker WebSocket from the client pool.
 - If all workers are busy, new TCP connections wait in the pending queue.
+- The client container defaults to reading `/client.toml`.
+- `scratch` images can still mount files or directories from the host through Docker or Compose volumes.
+
+## Release Outputs
+
+- GitHub Actions builds static Linux `amd64` and `arm64` binaries.
+- Release archives contain `server`, `client`, and the example config files.
+- The workflow also publishes a `scratch`-based GHCR image for `client`.

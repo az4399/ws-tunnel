@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use tokio::fs;
+use std::fs;
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -63,14 +63,14 @@ fn default_tcp_bind_addr() -> String {
     "0.0.0.0".to_string()
 }
 
-pub async fn load_server_config(path: &str) -> Result<ServerConfig, DynError> {
-    let text = fs::read_to_string(path).await?;
+pub fn load_server_config(path: &str) -> Result<ServerConfig, DynError> {
+    let text = fs::read_to_string(path)?;
     let cfg: ServerConfig = toml::from_str(&text)?;
     Ok(cfg)
 }
 
-pub async fn load_client_config(path: &str) -> Result<ClientConfig, DynError> {
-    let text = fs::read_to_string(path).await?;
+pub fn load_client_config(path: &str) -> Result<ClientConfig, DynError> {
+    let text = fs::read_to_string(path)?;
     let cfg: ClientConfig = toml::from_str(&text)?;
     Ok(cfg)
 }

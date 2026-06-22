@@ -1,0 +1,6 @@
+FROM scratch
+
+COPY app /app
+
+ENTRYPOINT ["/app"]
+CMD ["/client.toml"]
