@@ -11,9 +11,12 @@ use ws_tunnel::bridge::bridge_ws_and_tcp;
 use ws_tunnel::cli::{resolve_config_arg, CliAction};
 use ws_tunnel::config::{load_client_config, ClientConfig, DynError};
 use ws_tunnel::protocol;
+use ws_tunnel::tls::ensure_rustls_crypto_provider;
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
+    ensure_rustls_crypto_provider();
+
     let config_path = match resolve_config_arg("client", "client.toml", "examples/client.toml") {
         CliAction::RunWithConfig(path) => path,
         CliAction::ExitAfterHelp => return Ok(()),
