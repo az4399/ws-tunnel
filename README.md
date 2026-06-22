@@ -38,6 +38,9 @@ handshake_timeout_secs = 10
 ```toml
 # examples/client.toml
 server_url = "wss://tunnel.example.com/tunnel"
+# Optional: dial this host or IP instead of resolving the host in server_url.
+# Host header and TLS SNI still follow server_url.
+# connect_host = "1.2.3.4"
 token = "change-me"
 remote_port = 7000
 local_addr = "127.0.0.1:22"
@@ -71,5 +74,6 @@ cargo run --release --bin client -- examples/client.toml
 - The server does not terminate TLS.
 - `wss` is expected to be terminated by Cloudflare before reaching the VPS origin.
 - The client decides `remote_port`, and the server opens that TCP listener on demand.
+- You can keep `server_url` as a domain name and set `connect_host` to force the underlying TCP connection to a specific host or IP.
 - One incoming TCP connection consumes one idle worker WebSocket from the client pool.
 - If all workers are busy, new TCP connections wait in the pending queue.

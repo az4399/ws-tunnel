@@ -1,4 +1,6 @@
 server_url = "wss://tunnel.example.com/tunnel"
+# Optional: keep the Host/SNI from server_url, but connect TCP to this host or IP.
+# connect_host = "1.2.3.4"
 token = "change-me"
 remote_port = 7000
 local_addr = "127.0.0.1:22"

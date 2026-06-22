@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -12,6 +11,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response as WsR
 use tokio_tungstenite::tungstenite::handshake::server::ErrorResponse;
 use tokio_tungstenite::tungstenite::Message;
 use ws_tunnel::bridge::bridge_ws_and_tcp;
+use ws_tunnel::cli::{resolve_config_arg, CliAction};
 use ws_tunnel::config::{load_server_config, DynError, ServerConfig};
 use ws_tunnel::protocol;
 
@@ -31,9 +31,10 @@ struct ServerState {
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
-    let config_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "examples/server.toml".to_string());
+    let config_path = match resolve_config_arg("server", "server.toml", "examples/server.toml") {
+        CliAction::RunWithConfig(path) => path,
+        CliAction::ExitAfterHelp => return Ok(()),
+    };
 
     let cfg = Arc::new(load_server_config(&config_path).await?);
     let state = Arc::new(ServerState {

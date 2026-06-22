@@ -21,6 +21,7 @@ pub struct ServerConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ClientConfig {
     pub server_url: String,
+    pub connect_host: Option<String>,
     pub token: String,
     pub remote_port: u16,
     pub local_addr: String,

@@ -1,20 +1,23 @@
-use std::env;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
+use http::Uri;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Duration};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::client_async_tls_with_config;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use ws_tunnel::bridge::bridge_ws_and_tcp;
+use ws_tunnel::cli::{resolve_config_arg, CliAction};
 use ws_tunnel::config::{load_client_config, ClientConfig, DynError};
 use ws_tunnel::protocol;
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
-    let config_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "examples/client.toml".to_string());
+    let config_path = match resolve_config_arg("client", "client.toml", "examples/client.toml") {
+        CliAction::RunWithConfig(path) => path,
+        CliAction::ExitAfterHelp => return Ok(()),
+    };
 
     let cfg = Arc::new(load_client_config(&config_path).await?);
     let mut handles = Vec::with_capacity(cfg.worker_pool_size);
@@ -50,7 +53,7 @@ async fn run_worker_loop(worker_id: usize, cfg: Arc<ClientConfig>) {
 }
 
 async fn run_worker_once(worker_id: usize, cfg: Arc<ClientConfig>) -> Result<(), DynError> {
-    let (mut ws, _) = connect_async(cfg.server_url.as_str()).await?;
+    let (mut ws, _) = connect_websocket(&cfg).await?;
     ws.send(protocol::hello(&cfg.token, cfg.remote_port)).await?;
 
     loop {
@@ -93,4 +96,47 @@ async fn run_worker_once(worker_id: usize, cfg: Arc<ClientConfig>) -> Result<(),
 
     ws.send(protocol::ok()).await?;
     bridge_ws_and_tcp(ws, tcp).await
+}
+
+async fn connect_websocket(
+    cfg: &ClientConfig,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    DynError,
+> {
+    let uri: Uri = cfg.server_url.parse()?;
+    let request = uri.clone().into_client_request()?;
+    let host = cfg
+        .connect_host
+        .as_deref()
+        .or_else(|| uri.host())
+        .ok_or("server_url is missing a host")?;
+    let port = uri
+        .port_u16()
+        .or_else(|| match uri.scheme_str() {
+            Some("wss") => Some(443),
+            Some("ws") => Some(80),
+            _ => None,
+        })
+        .ok_or("server_url has an unsupported scheme")?;
+
+    let tcp = timeout(
+        Duration::from_secs(cfg.connect_timeout_secs),
+        TcpStream::connect((host, port)),
+    )
+    .await??;
+    tcp.set_nodelay(true)?;
+
+    let connected = timeout(
+        Duration::from_secs(cfg.connect_timeout_secs),
+        client_async_tls_with_config(request, tcp, None, None),
+    )
+    .await??;
+
+    Ok(connected)
 }
