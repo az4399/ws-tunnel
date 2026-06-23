@@ -70,11 +70,18 @@ fn spawn_worker(
 
 async fn run_worker_loop(worker_id: usize, cfg: Arc<ClientConfig>, pool: Arc<WorkerPoolState>) {
     loop {
-        if let Err(err) = run_worker_once(worker_id, cfg.clone(), pool.clone()).await {
-            eprintln!(
-                "worker {worker_id} reconnecting after error: {err}; retrying in {}s",
-                cfg.reconnect_delay_secs
-            );
+        match run_worker_once(worker_id, cfg.clone(), pool.clone()).await {
+            Ok(WorkerLoopAction::Continue) => {}
+            Ok(WorkerLoopAction::Retire) => {
+                eprintln!("worker {worker_id} retired because idle capacity is already sufficient");
+                return;
+            }
+            Err(err) => {
+                eprintln!(
+                    "worker {worker_id} reconnecting after error: {err}; retrying in {}s",
+                    cfg.reconnect_delay_secs
+                );
+            }
         }
 
         if should_retire_worker(&cfg, &pool) {
@@ -90,7 +97,11 @@ async fn run_worker_once(
     worker_id: usize,
     cfg: Arc<ClientConfig>,
     pool: Arc<WorkerPoolState>,
-) -> Result<(), DynError> {
+) -> Result<WorkerLoopAction, DynError> {
+    if should_retire_before_connect(&cfg, &pool) {
+        return Ok(WorkerLoopAction::Retire);
+    }
+
     let (mut ws, _) = connect_websocket(&cfg).await?;
     let dial_target = cfg
         .connect_host
@@ -105,7 +116,10 @@ async fn run_worker_once(
 
     let heartbeat_interval = heartbeat_duration(cfg.heartbeat_interval_secs);
     let mut counted_idle = false;
-    mark_idle(&pool, &mut counted_idle, worker_id, cfg.remote_port);
+    if !mark_idle(&cfg, &pool, &mut counted_idle, worker_id, cfg.remote_port) {
+        let _ = ws.close(None).await;
+        return Ok(WorkerLoopAction::Retire);
+    }
     loop {
         match wait_for_start(&mut ws, heartbeat_interval).await {
             Ok(WorkerCommand::Start) => {
@@ -147,12 +161,18 @@ async fn run_worker_once(
     );
 
     ws.send(protocol::ok()).await?;
-    bridge_ws_and_tcp(ws, tcp, heartbeat_interval).await
+    bridge_ws_and_tcp(ws, tcp, heartbeat_interval).await?;
+    Ok(WorkerLoopAction::Continue)
 }
 
 enum WorkerCommand {
     Start,
     Ignore,
+}
+
+enum WorkerLoopAction {
+    Continue,
+    Retire,
 }
 
 async fn wait_for_start(
@@ -285,14 +305,29 @@ fn reserve_worker_slot(pool: &WorkerPoolState, max_total_workers: usize) -> Opti
     }
 }
 
-fn mark_idle(pool: &WorkerPoolState, counted_idle: &mut bool, worker_id: usize, remote_port: u16) {
+fn mark_idle(
+    cfg: &ClientConfig,
+    pool: &WorkerPoolState,
+    counted_idle: &mut bool,
+    worker_id: usize,
+    remote_port: u16,
+) -> bool {
     if !*counted_idle {
+        let idle_target = cfg.worker_pool_size.max(1).min(cfg.max_total_workers.max(1));
+        let idle = pool.idle_workers.load(Ordering::SeqCst);
+        let total = pool.total_workers.load(Ordering::SeqCst);
+        if total > idle_target && idle >= idle_target {
+            return false;
+        }
+
         let idle = pool.idle_workers.fetch_add(1, Ordering::SeqCst) + 1;
         *counted_idle = true;
         eprintln!(
             "worker {worker_id} is idle for remote port {remote_port}; idle workers now {idle}"
         );
     }
+
+    true
 }
 
 fn unmark_idle(pool: &WorkerPoolState, counted_idle: &mut bool) {
@@ -326,6 +361,13 @@ fn ensure_idle_capacity(worker_id: usize, cfg: Arc<ClientConfig>, pool: Arc<Work
 }
 
 fn should_retire_worker(cfg: &ClientConfig, pool: &WorkerPoolState) -> bool {
+    let idle_target = cfg.worker_pool_size.max(1).min(cfg.max_total_workers.max(1));
+    let idle = pool.idle_workers.load(Ordering::SeqCst);
+    let total = pool.total_workers.load(Ordering::SeqCst);
+    total > idle_target && idle >= idle_target
+}
+
+fn should_retire_before_connect(cfg: &ClientConfig, pool: &WorkerPoolState) -> bool {
     let idle_target = cfg.worker_pool_size.max(1).min(cfg.max_total_workers.max(1));
     let idle = pool.idle_workers.load(Ordering::SeqCst);
     let total = pool.total_workers.load(Ordering::SeqCst);
