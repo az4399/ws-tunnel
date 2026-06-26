@@ -12,7 +12,7 @@ This project intentionally does not implement generic reverse proxy features.
 ## Layout
 
 - `server`: accepts worker WebSocket connections and opens requested TCP ports on demand
-- `client`: keeps a pool of outbound worker connections and forwards them to a local TCP service
+- `client`: keeps one control WebSocket and opens data WebSockets only when remote TCP connections arrive
 
 ## Example
 
@@ -44,7 +44,6 @@ server_url = "wss://tunnel.example.com/tunnel"
 token = "change-me"
 remote_port = 7000
 local_addr = "127.0.0.1:22"
-worker_pool_size = 8
 max_total_workers = 64
 reconnect_delay_secs = 3
 connect_timeout_secs = 10
@@ -113,10 +112,9 @@ services:
 - The client decides `remote_port`, and the server opens that TCP listener on demand.
 - You can keep `server_url` as a domain name and set `connect_host` to force the underlying TCP connection to a specific host or IP.
 - `heartbeat_interval_secs` controls WebSocket ping keepalive. Set it to `0` to disable heartbeats.
-- `worker_pool_size` is the target number of idle workers kept ready.
-- `max_total_workers` caps the total number of workers, including busy ones.
-- One incoming TCP connection consumes one idle worker WebSocket from the client pool.
-- If all workers are busy, new TCP connections wait in the pending queue.
+- The client keeps one control WebSocket registered with the server.
+- Data WebSockets are opened on demand, one per active incoming TCP connection.
+- `max_total_workers` caps active data workers. New TCP connections wait if the cap is reached.
 - The client container defaults to reading `/client.toml`.
 - `scratch` images can still mount files or directories from the host through Docker or Compose volumes.
 

@@ -4,11 +4,11 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use http::{Response, StatusCode};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::accept_hdr_async;
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response as WsResponse};
 use tokio_tungstenite::tungstenite::handshake::server::ErrorResponse;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response as WsResponse};
 use tokio_tungstenite::tungstenite::Message;
 use ws_tunnel::bridge::bridge_ws_and_tcp;
 use ws_tunnel::cli::{resolve_config_arg, CliAction};
@@ -21,6 +21,7 @@ struct WorkerHandle {
 
 struct MappingState {
     idle_tx: mpsc::Sender<WorkerHandle>,
+    connect_tx: broadcast::Sender<()>,
 }
 
 struct ServerState {
@@ -53,9 +54,7 @@ async fn main() -> Result<(), DynError> {
     Ok(())
 }
 
-async fn run_ws_listener(
-    state: Arc<ServerState>,
-) -> Result<(), DynError> {
+async fn run_ws_listener(state: Arc<ServerState>) -> Result<(), DynError> {
     let listener = TcpListener::bind(&state.cfg.ws_bind).await?;
     eprintln!("ws server listening on {}", state.cfg.ws_bind);
 
@@ -73,7 +72,10 @@ async fn run_ws_listener(
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_worker(stream, state).await {
-                eprintln!("worker session from {addr} ended: {}", describe_worker_error(&err));
+                eprintln!(
+                    "worker session from {addr} ended: {}",
+                    describe_worker_error(&err)
+                );
             }
         });
     }
@@ -82,16 +84,50 @@ async fn run_ws_listener(
 async fn dispatch_tcp_to_workers(
     mut tcp_rx: mpsc::Receiver<TcpStream>,
     mut idle_rx: mpsc::Receiver<WorkerHandle>,
+    connect_tx: broadcast::Sender<()>,
 ) -> Result<(), DynError> {
     while let Some(stream) = tcp_rx.recv().await {
         let mut pending = Some(stream);
-        while let Some(worker) = idle_rx.recv().await {
-            let stream = pending.take().expect("pending tcp stream missing");
-            match worker.assign.send(stream) {
-                Ok(()) => break,
-                Err(stream) => {
-                    pending = Some(stream);
-                    continue;
+        loop {
+            match idle_rx.try_recv() {
+                Ok(worker) => {
+                    let stream = pending.take().expect("pending tcp stream missing");
+                    match worker.assign.send(stream) {
+                        Ok(()) => break,
+                        Err(stream) => {
+                            pending = Some(stream);
+                            continue;
+                        }
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err("worker dispatcher lost its idle worker queue".into());
+                }
+            }
+
+            if connect_tx.send(()).is_err() {
+                eprintln!("no control connection is ready; waiting for client to reconnect");
+            }
+
+            match timeout(Duration::from_secs(5), idle_rx.recv()).await {
+                Ok(Some(worker)) => {
+                    let stream = pending.take().expect("pending tcp stream missing");
+                    match worker.assign.send(stream) {
+                        Ok(()) => break,
+                        Err(stream) => {
+                            pending = Some(stream);
+                            continue;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    return Err("worker dispatcher lost its idle worker queue".into());
+                }
+                Err(_) => {
+                    eprintln!(
+                        "still waiting for an on-demand worker; retrying control notification"
+                    );
                 }
             }
         }
@@ -99,10 +135,7 @@ async fn dispatch_tcp_to_workers(
     Ok(())
 }
 
-async fn handle_worker(
-    stream: TcpStream,
-    state: Arc<ServerState>,
-) -> Result<(), DynError> {
+async fn handle_worker(stream: TcpStream, state: Arc<ServerState>) -> Result<(), DynError> {
     let expected_path = state.cfg.path.clone();
     let ws = accept_hdr_async(stream, move |req: &Request, response: WsResponse| {
         validate_path(req, response, &expected_path)
@@ -116,14 +149,20 @@ async fn handle_worker(
     )
     .await?;
 
-    let (token, remote_port) = match first {
-        Some(Ok(Message::Text(text))) => protocol::parse_hello(&text)
-            .map(|(token, remote_port)| (token.to_string(), remote_port))
-            .ok_or_else(|| "invalid HELLO frame".to_string())?,
+    let text = match first {
+        Some(Ok(Message::Text(text))) => text,
         Some(Ok(_)) => return Err("first worker frame must be text HELLO".into()),
         Some(Err(err)) => return Err(err.into()),
-        None => return Err("worker closed before HELLO".into()),
+        None => return Err("worker closed before authentication frame".into()),
     };
+
+    if let Some((token, remote_port)) = protocol::parse_control(&text) {
+        return handle_control(ws, state, token, remote_port).await;
+    }
+
+    let (token, remote_port) = protocol::parse_hello(&text)
+        .map(|(token, remote_port)| (token.to_string(), remote_port))
+        .ok_or_else(|| "invalid HELLO frame".to_string())?;
 
     if token != state.cfg.token {
         let _ = ws.send(protocol::err("invalid token")).await;
@@ -160,7 +199,58 @@ async fn handle_worker(
     bridge_ws_and_tcp(ws, tcp_stream, None).await
 }
 
-async fn ensure_mapping(state: Arc<ServerState>, remote_port: u16) -> Result<Arc<MappingState>, DynError> {
+async fn handle_control(
+    mut ws: tokio_tungstenite::WebSocketStream<TcpStream>,
+    state: Arc<ServerState>,
+    token: &str,
+    remote_port: u16,
+) -> Result<(), DynError> {
+    if token != state.cfg.token {
+        let _ = ws.send(protocol::err("invalid token")).await;
+        return Err("control token mismatch".into());
+    }
+
+    let mapping = ensure_mapping(state, remote_port).await?;
+    let mut connect_rx = mapping.connect_tx.subscribe();
+    eprintln!("control connection authenticated for remote port {remote_port}");
+
+    loop {
+        tokio::select! {
+            signal = connect_rx.recv() => {
+                match signal {
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        ws.send(protocol::connect()).await?;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err("control notification channel closed".into());
+                    }
+                }
+            }
+            incoming = ws.next() => {
+                match incoming {
+                    Some(Ok(Message::Ping(data))) => {
+                        ws.send(Message::Pong(data)).await?;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) => return Err("control connection closed".into()),
+                    Some(Ok(Message::Text(text))) => {
+                        return Err(format!("unexpected control text frame: {text}").into());
+                    }
+                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {
+                        return Err("unexpected control data frame".into());
+                    }
+                    Some(Err(err)) => return Err(err.into()),
+                    None => return Err("control connection disconnected".into()),
+                }
+            }
+        }
+    }
+}
+
+async fn ensure_mapping(
+    state: Arc<ServerState>,
+    remote_port: u16,
+) -> Result<Arc<MappingState>, DynError> {
     if let Some(existing) = state.mappings.lock().await.get(&remote_port).cloned() {
         return Ok(existing);
     }
@@ -177,7 +267,11 @@ async fn ensure_mapping(state: Arc<ServerState>, remote_port: u16) -> Result<Arc
     let (idle_tx, idle_rx) = mpsc::channel::<WorkerHandle>(state.cfg.idle_worker_backlog);
     let (tcp_tx, tcp_rx) = mpsc::channel::<TcpStream>(state.cfg.pending_tcp_backlog);
 
-    let mapping = Arc::new(MappingState { idle_tx });
+    let (connect_tx, _) = broadcast::channel::<()>(state.cfg.pending_tcp_backlog);
+    let mapping = Arc::new(MappingState {
+        idle_tx,
+        connect_tx,
+    });
 
     {
         let mut guard = state.mappings.lock().await;
@@ -194,12 +288,19 @@ async fn ensure_mapping(state: Arc<ServerState>, remote_port: u16) -> Result<Arc
     });
 
     tokio::spawn(async move {
-        if let Err(err) = dispatch_tcp_to_workers(tcp_rx, idle_rx).await {
+        if let Err(err) = dispatch_tcp_to_workers(tcp_rx, idle_rx, mapping.connect_tx.clone()).await
+        {
             eprintln!("dispatcher for port {remote_port} stopped: {err}");
         }
     });
 
-    Ok(mapping)
+    Ok(state
+        .mappings
+        .lock()
+        .await
+        .get(&remote_port)
+        .cloned()
+        .expect("mapping missing after insert"))
 }
 
 async fn run_dynamic_tcp_listener(
@@ -287,8 +388,10 @@ fn describe_worker_error(err: &DynError) -> String {
     if text.contains("invalid token") || text.contains("token mismatch") {
         return "worker authentication failed because the provided token did not match the server token".to_string();
     }
-    if text.contains("worker closed before HELLO") || text.contains("first worker frame must be text HELLO") {
-        return "worker disconnected before sending a valid HELLO authentication frame".to_string();
+    if text.contains("worker closed before")
+        || text.contains("first worker frame must be text HELLO")
+    {
+        return "worker disconnected before sending a valid authentication frame".to_string();
     }
     text
 }

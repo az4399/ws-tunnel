@@ -25,8 +25,6 @@ pub struct ClientConfig {
     pub token: String,
     pub remote_port: u16,
     pub local_addr: String,
-    #[serde(default = "default_worker_pool")]
-    pub worker_pool_size: usize,
     #[serde(default = "default_max_total_workers")]
     pub max_total_workers: usize,
     #[serde(default = "default_reconnect_delay")]
@@ -39,10 +37,6 @@ pub struct ClientConfig {
 
 fn default_backlog() -> usize {
     128
-}
-
-fn default_worker_pool() -> usize {
-    8
 }
 
 fn default_reconnect_delay() -> u64 {

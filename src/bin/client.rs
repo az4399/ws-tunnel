@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use http::Uri;
@@ -14,10 +14,9 @@ use ws_tunnel::config::{load_client_config, ClientConfig, DynError};
 use ws_tunnel::protocol;
 use ws_tunnel::tls::ensure_rustls_crypto_provider;
 
-struct WorkerPoolState {
+struct WorkerState {
     next_worker_id: AtomicUsize,
-    total_workers: AtomicUsize,
-    idle_workers: AtomicUsize,
+    active_workers: AtomicUsize,
 }
 
 #[tokio::main]
@@ -30,110 +29,90 @@ async fn main() -> Result<(), DynError> {
     };
 
     let cfg = Arc::new(load_client_config(&config_path)?);
-    let max_total_workers = cfg.max_total_workers.max(1);
-    let idle_target = cfg.worker_pool_size.max(1).min(max_total_workers);
-    if cfg.worker_pool_size.max(1) > max_total_workers {
-        eprintln!(
-            "worker_pool_size {} is higher than max_total_workers {}; idle pool will be capped at {}",
-            cfg.worker_pool_size.max(1),
-            max_total_workers,
-            idle_target
-        );
-    }
-    let pool = Arc::new(WorkerPoolState {
+    let state = Arc::new(WorkerState {
         next_worker_id: AtomicUsize::new(0),
-        total_workers: AtomicUsize::new(0),
-        idle_workers: AtomicUsize::new(0),
+        active_workers: AtomicUsize::new(0),
     });
 
-    for _ in 0..idle_target {
-        let _ = spawn_worker(cfg.clone(), pool.clone());
+    tokio::select! {
+        _ = run_control_loop(cfg, state) => {}
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            eprintln!("client received Ctrl+C, shutting down");
+        }
     }
-
-    tokio::signal::ctrl_c().await?;
-    eprintln!("client received Ctrl+C, shutting down");
 
     Ok(())
 }
 
-fn spawn_worker(
-    cfg: Arc<ClientConfig>,
-    pool: Arc<WorkerPoolState>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let worker_id = reserve_worker_slot(&pool, cfg.max_total_workers.max(1))?;
-    Some(tokio::spawn(async move {
-        run_worker_loop(worker_id, cfg, pool.clone()).await;
-        let remaining = pool.total_workers.fetch_sub(1, Ordering::SeqCst) - 1;
-        eprintln!("worker {worker_id} stopped; total workers now {remaining}");
-    }))
-}
-
-async fn run_worker_loop(worker_id: usize, cfg: Arc<ClientConfig>, pool: Arc<WorkerPoolState>) {
+async fn run_control_loop(cfg: Arc<ClientConfig>, state: Arc<WorkerState>) {
     loop {
-        match run_worker_once(worker_id, cfg.clone(), pool.clone()).await {
-            Ok(WorkerLoopAction::Continue) => {}
-            Ok(WorkerLoopAction::Retire) => {
-                eprintln!("worker {worker_id} retired because idle capacity is already sufficient");
-                return;
-            }
-            Err(err) => {
-                eprintln!(
-                    "worker {worker_id} reconnecting after error: {err}; retrying in {}s",
-                    cfg.reconnect_delay_secs
-                );
-            }
+        if let Err(err) = run_control_once(cfg.clone(), state.clone()).await {
+            eprintln!(
+                "control connection reconnecting after error: {err}; retrying in {}s",
+                cfg.reconnect_delay_secs
+            );
         }
 
-        if should_retire_worker(&cfg, &pool) {
-            eprintln!("worker {worker_id} retired because idle capacity is already sufficient");
-            return;
-        }
-
-        sleep(reconnect_delay(worker_id, cfg.reconnect_delay_secs)).await;
+        sleep(Duration::from_secs(cfg.reconnect_delay_secs)).await;
     }
 }
 
-async fn run_worker_once(
-    worker_id: usize,
-    cfg: Arc<ClientConfig>,
-    pool: Arc<WorkerPoolState>,
-) -> Result<WorkerLoopAction, DynError> {
-    if should_retire_before_connect(&cfg, &pool) {
-        return Ok(WorkerLoopAction::Retire);
-    }
-
+async fn run_control_once(cfg: Arc<ClientConfig>, state: Arc<WorkerState>) -> Result<(), DynError> {
     let (mut ws, _) = connect_websocket(&cfg).await?;
     let dial_target = cfg
         .connect_host
         .clone()
         .or_else(|| host_from_server_url(&cfg.server_url).ok())
         .unwrap_or_else(|| "unknown".to_string());
+
+    ws.send(protocol::control(&cfg.token, cfg.remote_port))
+        .await?;
     eprintln!(
-        "worker {worker_id} connected to {} using {} for remote port {}",
+        "control connection established to {} using {} for remote port {}",
         cfg.server_url, dial_target, cfg.remote_port
     );
-    ws.send(protocol::hello(&cfg.token, cfg.remote_port)).await?;
 
     let heartbeat_interval = heartbeat_duration(cfg.heartbeat_interval_secs);
-    let mut counted_idle = false;
-    if !mark_idle(&cfg, &pool, &mut counted_idle, worker_id, cfg.remote_port) {
-        let _ = ws.close(None).await;
-        return Ok(WorkerLoopAction::Retire);
-    }
     loop {
-        match wait_for_start(&mut ws, heartbeat_interval).await {
-            Ok(WorkerCommand::Start) => {
-                unmark_idle(&pool, &mut counted_idle);
-                ensure_idle_capacity(worker_id, cfg.clone(), pool.clone());
-                break;
+        match wait_for_control_command(&mut ws, heartbeat_interval).await? {
+            ControlCommand::Connect => {
+                if spawn_data_worker(cfg.clone(), state.clone()).is_none() {
+                    eprintln!(
+                        "worker cap {} reached; waiting before accepting more remote connections",
+                        cfg.max_total_workers.max(1)
+                    );
+                }
             }
-            Ok(WorkerCommand::Ignore) => continue,
-            Err(err) => {
-                unmark_idle(&pool, &mut counted_idle);
-                return Err(err);
-            }
+            ControlCommand::Ignore => {}
         }
     }
+}
+
+fn spawn_data_worker(
+    cfg: Arc<ClientConfig>,
+    state: Arc<WorkerState>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let worker_id = reserve_worker_slot(&state, cfg.max_total_workers.max(1))?;
+    Some(tokio::spawn(async move {
+        if let Err(err) = run_data_worker(worker_id, cfg, state.clone()).await {
+            eprintln!("worker {worker_id} ended after error: {err}");
+        }
+        let remaining = state.active_workers.fetch_sub(1, Ordering::SeqCst) - 1;
+        eprintln!("worker {worker_id} stopped; active workers now {remaining}");
+    }))
+}
+
+async fn run_data_worker(
+    worker_id: usize,
+    cfg: Arc<ClientConfig>,
+    state: Arc<WorkerState>,
+) -> Result<(), DynError> {
+    let (mut ws, _) = connect_websocket(&cfg).await?;
+    ws.send(protocol::hello(&cfg.token, cfg.remote_port))
+        .await?;
+
+    wait_for_start(&mut ws).await?;
 
     let tcp = match timeout(
         Duration::from_secs(cfg.connect_timeout_secs),
@@ -151,60 +130,77 @@ async fn run_worker_once(
             return Err(format!(
                 "timed out opening local target {}; check whether the local service is reachable",
                 cfg.local_addr
-            ).into());
+            )
+            .into());
         }
     };
     tcp.set_nodelay(true)?;
+
+    let active = state.active_workers.load(Ordering::SeqCst);
     eprintln!(
-        "worker {worker_id} bound remote port {} to local {}",
+        "worker {worker_id} bound remote port {} to local {}; active workers now {active}",
         cfg.remote_port, cfg.local_addr
     );
 
     ws.send(protocol::ok()).await?;
-    bridge_ws_and_tcp(ws, tcp, heartbeat_interval).await?;
-    Ok(WorkerLoopAction::Continue)
+    bridge_ws_and_tcp(ws, tcp, heartbeat_duration(cfg.heartbeat_interval_secs)).await
 }
 
-enum WorkerCommand {
-    Start,
+enum ControlCommand {
+    Connect,
     Ignore,
 }
 
-enum WorkerLoopAction {
-    Continue,
-    Retire,
+async fn wait_for_control_command(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    heartbeat_interval: Option<Duration>,
+) -> Result<ControlCommand, DynError> {
+    if let Some(heartbeat_interval) = heartbeat_interval {
+        tokio::select! {
+            incoming = ws.next() => handle_control_message(incoming),
+            _ = sleep(heartbeat_interval) => {
+                ws.send(Message::Ping(Vec::new().into())).await?;
+                Ok(ControlCommand::Ignore)
+            }
+        }
+    } else {
+        handle_control_message(ws.next().await)
+    }
+}
+
+fn handle_control_message(
+    message: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+) -> Result<ControlCommand, DynError> {
+    match message {
+        Some(Ok(Message::Text(text))) if text == protocol::CMD_CONNECT => {
+            Ok(ControlCommand::Connect)
+        }
+        Some(Ok(Message::Text(text))) => {
+            if let Some(err_text) = protocol::parse_err(&text) {
+                return Err(format!("server rejected control connection: {err_text}").into());
+            }
+            Err(format!("unexpected control command from server: {text}").into())
+        }
+        Some(Ok(Message::Ping(_))) => Ok(ControlCommand::Ignore),
+        Some(Ok(Message::Pong(_))) => Ok(ControlCommand::Ignore),
+        Some(Ok(Message::Close(_))) => Err("server closed control connection".into()),
+        Some(Ok(_)) => Err("unexpected non-text control command from server".into()),
+        Some(Err(err)) => Err(err.into()),
+        None => Err("server closed control connection".into()),
+    }
 }
 
 async fn wait_for_start(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    heartbeat_interval: Option<Duration>,
-) -> Result<WorkerCommand, DynError> {
-    if let Some(heartbeat_interval) = heartbeat_interval {
-        tokio::select! {
-            incoming = ws.next() => handle_worker_message(incoming),
-            _ = sleep(heartbeat_interval) => {
-                ws.send(Message::Ping(Vec::new().into())).await?;
-                Ok(WorkerCommand::Ignore)
-            }
-        }
-    } else {
-        handle_worker_message(ws.next().await)
-    }
-}
-
-fn handle_worker_message(
-    message: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
-) -> Result<WorkerCommand, DynError> {
-    match message {
-        Some(Ok(Message::Text(text))) if text == protocol::CMD_START => Ok(WorkerCommand::Start),
+) -> Result<(), DynError> {
+    match ws.next().await {
+        Some(Ok(Message::Text(text))) if text == protocol::CMD_START => Ok(()),
         Some(Ok(Message::Text(text))) => {
             if let Some(err_text) = protocol::parse_err(&text) {
                 return Err(format!("server rejected worker: {err_text}").into());
             }
             Err(format!("unexpected text command from server: {text}").into())
         }
-        Some(Ok(Message::Ping(_))) => Ok(WorkerCommand::Ignore),
-        Some(Ok(Message::Pong(_))) => Ok(WorkerCommand::Ignore),
         Some(Ok(Message::Close(_))) => Err("server closed worker before START".into()),
         Some(Ok(_)) => Err("unexpected non-text command from server".into()),
         Some(Err(err)) => Err(err.into()),
@@ -216,9 +212,7 @@ async fn connect_websocket(
     cfg: &ClientConfig,
 ) -> Result<
     (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<TcpStream>,
-        >,
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
         tokio_tungstenite::tungstenite::handshake::client::Response,
     ),
     DynError,
@@ -282,96 +276,21 @@ fn heartbeat_duration(secs: u64) -> Option<Duration> {
     }
 }
 
-fn reconnect_delay(worker_id: usize, base_secs: u64) -> Duration {
-    let base = Duration::from_secs(base_secs);
-    let jitter_ms = ((worker_id as u64) % 10) * 200;
-    base + Duration::from_millis(jitter_ms)
-}
-
-fn reserve_worker_slot(pool: &WorkerPoolState, max_total_workers: usize) -> Option<usize> {
+fn reserve_worker_slot(state: &WorkerState, max_total_workers: usize) -> Option<usize> {
     loop {
-        let total = pool.total_workers.load(Ordering::SeqCst);
+        let total = state.active_workers.load(Ordering::SeqCst);
         if total >= max_total_workers {
             return None;
         }
 
-        if pool
-            .total_workers
+        if state
+            .active_workers
             .compare_exchange(total, total + 1, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            return Some(pool.next_worker_id.fetch_add(1, Ordering::SeqCst));
+            return Some(state.next_worker_id.fetch_add(1, Ordering::SeqCst));
         }
     }
-}
-
-fn mark_idle(
-    cfg: &ClientConfig,
-    pool: &WorkerPoolState,
-    counted_idle: &mut bool,
-    worker_id: usize,
-    remote_port: u16,
-) -> bool {
-    if !*counted_idle {
-        let idle_target = cfg.worker_pool_size.max(1).min(cfg.max_total_workers.max(1));
-        let idle = pool.idle_workers.load(Ordering::SeqCst);
-        let total = pool.total_workers.load(Ordering::SeqCst);
-        if total > idle_target && idle >= idle_target {
-            return false;
-        }
-
-        let idle = pool.idle_workers.fetch_add(1, Ordering::SeqCst) + 1;
-        *counted_idle = true;
-        eprintln!(
-            "worker {worker_id} is idle for remote port {remote_port}; idle workers now {idle}"
-        );
-    }
-
-    true
-}
-
-fn unmark_idle(pool: &WorkerPoolState, counted_idle: &mut bool) {
-    if *counted_idle {
-        pool.idle_workers.fetch_sub(1, Ordering::SeqCst);
-        *counted_idle = false;
-    }
-}
-
-fn ensure_idle_capacity(worker_id: usize, cfg: Arc<ClientConfig>, pool: Arc<WorkerPoolState>) {
-    let idle_target = cfg.worker_pool_size.max(1).min(cfg.max_total_workers.max(1));
-    let idle = pool.idle_workers.load(Ordering::SeqCst);
-    let total = pool.total_workers.load(Ordering::SeqCst);
-
-    if idle >= idle_target {
-        return;
-    }
-
-    if let Some(handle) = spawn_worker(cfg.clone(), pool.clone()) {
-        drop(handle);
-        eprintln!(
-            "worker {worker_id} became busy; spawning replacement worker (idle {idle}, total {total})"
-        );
-    } else if total < idle_target {
-        eprintln!(
-            "worker {worker_id} became busy, but worker cap {} prevents keeping {} idle workers ready",
-            cfg.max_total_workers.max(1),
-            idle_target
-        );
-    }
-}
-
-fn should_retire_worker(cfg: &ClientConfig, pool: &WorkerPoolState) -> bool {
-    let idle_target = cfg.worker_pool_size.max(1).min(cfg.max_total_workers.max(1));
-    let idle = pool.idle_workers.load(Ordering::SeqCst);
-    let total = pool.total_workers.load(Ordering::SeqCst);
-    total > idle_target && idle >= idle_target
-}
-
-fn should_retire_before_connect(cfg: &ClientConfig, pool: &WorkerPoolState) -> bool {
-    let idle_target = cfg.worker_pool_size.max(1).min(cfg.max_total_workers.max(1));
-    let idle = pool.idle_workers.load(Ordering::SeqCst);
-    let total = pool.total_workers.load(Ordering::SeqCst);
-    total > idle_target && idle >= idle_target
 }
 
 fn host_from_server_url(server_url: &str) -> Result<String, DynError> {
